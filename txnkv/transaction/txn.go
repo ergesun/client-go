@@ -37,6 +37,7 @@ package transaction
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -76,6 +77,8 @@ type tempLockBufferEntry struct {
 	HasReturnValue    bool
 	HasCheckExistence bool
 	Value             tikv.ReturnedValue
+
+	ActualLockForUpdateTS uint64
 }
 
 // trySkipLockingOnRetry checks if the key can be skipped in an aggressive locking context, and performs necessary
@@ -155,11 +158,13 @@ type KVTxn struct {
 	interceptor    interceptor.RPCInterceptor
 	assertionLevel kvrpcpb.AssertionLevel
 	*util.RequestSource
-	// resourceGroupName is the name of tenent resource group.
+	// resourceGroupName is the name of tenant resource group.
 	resourceGroupName string
 
 	aggressiveLockingContext *aggressiveLockingContext
 	aggressiveLockingDirty   bool
+
+	forUpdateTSChecks map[string]uint64
 }
 
 // NewTiKVTxn creates a new KVTxn.
@@ -233,7 +238,7 @@ func (txn *KVTxn) Set(k []byte, v []byte) error {
 // String implements fmt.Stringer interface.
 func (txn *KVTxn) String() string {
 	res := fmt.Sprintf("%d", txn.StartTS())
-	if txn.aggressiveLockingContext != nil {
+	if txn.IsInAggressiveLockingMode() {
 		res += fmt.Sprintf(" (aggressiveLocking: prev %d keys, current %d keys)", len(txn.aggressiveLockingContext.lastRetryUnnecessaryLocks), len(txn.aggressiveLockingContext.currentLockedKeys))
 	}
 	return res
@@ -419,7 +424,7 @@ func (txn *KVTxn) Commit(ctx context.Context) error {
 
 	ctx = context.WithValue(ctx, util.RequestSourceKey, *txn.RequestSource)
 
-	if txn.aggressiveLockingContext != nil {
+	if txn.IsInAggressiveLockingMode() {
 		if len(txn.aggressiveLockingContext.currentLockedKeys) != 0 {
 			return errors.New("trying to commit transaction when aggressive locking is pending")
 		}
@@ -434,7 +439,13 @@ func (txn *KVTxn) Commit(ctx context.Context) error {
 	}
 
 	start := time.Now()
-	defer func() { metrics.TxnCmdHistogramWithCommit.Observe(time.Since(start).Seconds()) }()
+	defer func() {
+		if txn.isInternal() {
+			metrics.TxnCmdHistogramWithCommitInternal.Observe(time.Since(start).Seconds())
+		} else {
+			metrics.TxnCmdHistogramWithCommitGeneral.Observe(time.Since(start).Seconds())
+		}
+	}()
 
 	// sessionID is used for log.
 	var sessionID uint64
@@ -463,6 +474,7 @@ func (txn *KVTxn) Commit(ctx context.Context) error {
 
 	txn.committer.SetDiskFullOpt(txn.diskFullOpt)
 	txn.committer.SetTxnSource(txn.txnSource)
+	txn.committer.forUpdateTSConstraints = txn.forUpdateTSChecks
 
 	defer committer.ttlManager.close()
 
@@ -542,7 +554,7 @@ func (txn *KVTxn) Rollback() error {
 		return tikverr.ErrInvalidTxn
 	}
 
-	if txn.aggressiveLockingContext != nil {
+	if txn.IsInAggressiveLockingMode() {
 		if len(txn.aggressiveLockingContext.currentLockedKeys) != 0 {
 			txn.close()
 			return errors.New("trying to rollback transaction when aggressive locking is pending")
@@ -561,7 +573,11 @@ func (txn *KVTxn) Rollback() error {
 	}
 	txn.close()
 	logutil.BgLogger().Debug("[kv] rollback txn", zap.Uint64("txnStartTS", txn.StartTS()))
-	metrics.TxnCmdHistogramWithRollback.Observe(time.Since(start).Seconds())
+	if txn.isInternal() {
+		metrics.TxnCmdHistogramWithRollbackInternal.Observe(time.Since(start).Seconds())
+	} else {
+		metrics.TxnCmdHistogramWithRollbackGeneral.Observe(time.Since(start).Seconds())
+	}
 	return nil
 }
 
@@ -592,6 +608,10 @@ func (txn *KVTxn) collectLockedKeys() [][]byte {
 		}
 	}
 	return keys
+}
+
+func (txn *KVTxn) isInternal() bool {
+	return util.IsRequestSourceInternal(txn.RequestSource)
 }
 
 // TxnInfo is used to keep track the info of a committed transaction (mainly for diagnosis and testing)
@@ -662,7 +682,7 @@ func (txn *KVTxn) LockKeysWithWaitTime(ctx context.Context, lockWaitTime int64, 
 // invocations that involves only one key, the pessimistic lock request will be performed in ForceLock mode
 // (kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeForceLock).
 func (txn *KVTxn) StartAggressiveLocking() {
-	if txn.aggressiveLockingContext != nil {
+	if txn.IsInAggressiveLockingMode() {
 		panic("Trying to start aggressive locking while it's already started")
 	}
 	txn.aggressiveLockingContext = &aggressiveLockingContext{
@@ -733,6 +753,11 @@ func (txn *KVTxn) DoneAggressiveLocking(ctx context.Context) {
 		panic("Trying to finish aggressive locking while it's not started")
 	}
 	txn.cleanupAggressiveLockingRedundantLocks(context.Background())
+
+	if txn.forUpdateTSChecks == nil {
+		txn.forUpdateTSChecks = make(map[string]uint64, len(txn.aggressiveLockingContext.currentLockedKeys))
+	}
+
 	memBuffer := txn.GetMemBuffer()
 	for key, entry := range txn.aggressiveLockingContext.currentLockedKeys {
 		setValExists := tikv.SetKeyLockedValueExists
@@ -740,6 +765,10 @@ func (txn *KVTxn) DoneAggressiveLocking(ctx context.Context) {
 			setValExists = tikv.SetKeyLockedValueNotExists
 		}
 		memBuffer.UpdateFlags([]byte(key), tikv.SetKeyLocked, tikv.DelNeedCheckExists, setValExists)
+
+		if _, ok := txn.forUpdateTSChecks[key]; !ok {
+			txn.forUpdateTSChecks[key] = entry.ActualLockForUpdateTS
+		}
 	}
 	if txn.aggressiveLockingContext.maxLockedWithConflictTS > 0 {
 		// There are some keys locked so the committer must have been created.
@@ -757,7 +786,7 @@ func (txn *KVTxn) IsInAggressiveLockingMode() bool {
 
 // IsInAggressiveLockingStage checks if a key is locked during the current aggressive locking stage.
 func (txn *KVTxn) IsInAggressiveLockingStage(key []byte) bool {
-	if txn.aggressiveLockingContext != nil {
+	if txn.IsInAggressiveLockingMode() {
 		_, ok := txn.aggressiveLockingContext.currentLockedKeys[string(key)]
 		return ok
 	}
@@ -831,6 +860,41 @@ func (txn *KVTxn) filterAggressiveLockedKeys(lockCtx *tikv.LockCtx, allKeys [][]
 	return keys, nil
 }
 
+// collectAggressiveLockingStats collects statistics about aggressive locking and updates metrics if needed.
+func (txn *KVTxn) collectAggressiveLockingStats(lockCtx *tikv.LockCtx, keys int, skippedLockKeys int, filteredAggressiveLockedKeysCount int, lockWakeUpMode kvrpcpb.PessimisticLockWakeUpMode) {
+	if keys > 0 {
+		lockCtx.Stats.AggressiveLockNewCount += keys - skippedLockKeys
+
+		lockedWithConflictCount := 0
+		for _, v := range lockCtx.Values {
+			if v.LockedWithConflictTS != 0 {
+				lockedWithConflictCount++
+			}
+		}
+		lockCtx.Stats.LockedWithConflictCount += lockedWithConflictCount
+		metrics.AggressiveLockedKeysLockedWithConflict.Add(float64(lockedWithConflictCount))
+
+		if lockWakeUpMode == kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeNormal {
+			metrics.AggressiveLockedKeysNonForceLock.Add(float64(keys))
+		}
+	}
+
+	lockCtx.Stats.AggressiveLockDerivedCount += filteredAggressiveLockedKeysCount
+}
+
+func (txn *KVTxn) exitAggressiveLockingIfInapplicable(ctx context.Context, keys [][]byte) error {
+	if len(keys) > 1 && txn.IsInAggressiveLockingMode() {
+		// Only allow fair locking if it only needs to lock one key. Considering that it's possible that a
+		// statement causes multiple calls to `LockKeys` (which means some keys may have been locked in fair
+		// locking mode), here we exit fair locking mode by calling DoneFairLocking instead of cancelling.
+		// Then the previously-locked keys during execution in this statement (if any) will be turned into the state
+		// as if they were locked in normal way.
+		// Note that the issue https://github.com/pingcap/tidb/issues/35682 also exists here.
+		txn.DoneAggressiveLocking(ctx)
+	}
+	return nil
+}
+
 // LockKeys tries to lock the entries with the keys in KV store.
 // lockCtx is the context for lock, lockCtx.lockWaitTime in ms
 func (txn *KVTxn) LockKeys(ctx context.Context, lockCtx *tikv.LockCtx, keysInput ...[]byte) error {
@@ -859,8 +923,18 @@ func (txn *KVTxn) lockKeys(ctx context.Context, lockCtx *tikv.LockCtx, fn func()
 	startTime := time.Now()
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
+
+	err = txn.exitAggressiveLockingIfInapplicable(ctx, keysInput)
+	if err != nil {
+		return err
+	}
+
 	defer func() {
-		metrics.TxnCmdHistogramWithLockKeys.Observe(time.Since(startTime).Seconds())
+		if txn.isInternal() {
+			metrics.TxnCmdHistogramWithLockKeysInternal.Observe(time.Since(startTime).Seconds())
+		} else {
+			metrics.TxnCmdHistogramWithLockKeysGeneral.Observe(time.Since(startTime).Seconds())
+		}
 		if err == nil {
 			if lockCtx.PessimisticLockWaited != nil {
 				if atomic.LoadInt32(lockCtx.PessimisticLockWaited) > 0 {
@@ -888,7 +962,7 @@ func (txn *KVTxn) lockKeys(ctx context.Context, lockCtx *tikv.LockCtx, fn func()
 		}
 	}()
 
-	if !txn.IsPessimistic() && txn.aggressiveLockingContext != nil {
+	if !txn.IsPessimistic() && txn.IsInAggressiveLockingMode() {
 		return errors.New("trying to perform aggressive locking in optimistic transaction")
 	}
 
@@ -905,7 +979,7 @@ func (txn *KVTxn) lockKeys(ctx context.Context, lockCtx *tikv.LockCtx, fn func()
 		}
 		// If the key is locked in the current aggressive locking stage, override the information in memBuf.
 		isInLastAggressiveLockingStage := false
-		if txn.aggressiveLockingContext != nil {
+		if txn.IsInAggressiveLockingMode() {
 			if entry, ok := txn.aggressiveLockingContext.currentLockedKeys[string(key)]; ok {
 				locked = true
 				valueExist = entry.Value.Exists
@@ -962,7 +1036,9 @@ func (txn *KVTxn) lockKeys(ctx context.Context, lockCtx *tikv.LockCtx, fn func()
 	}
 	keys = deduplicateKeys(keys)
 	checkedExistence := false
+	filteredAggressiveLockedKeysCount := 0
 	var assignedPrimaryKey bool
+	lockWakeUpMode := kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeNormal
 	if txn.IsPessimistic() && lockCtx.ForUpdateTS > 0 {
 		if txn.committer == nil {
 			// sessionID is used for log.
@@ -985,33 +1061,39 @@ func (txn *KVTxn) lockKeys(ctx context.Context, lockCtx *tikv.LockCtx, fn func()
 		txn.committer.forUpdateTS = lockCtx.ForUpdateTS
 
 		allKeys := keys
+		lockCtx.Stats = &util.LockKeysDetails{
+			LockKeys:    int32(len(keys)),
+			ResolveLock: util.ResolveLockDetail{},
+		}
 
-		// If aggressive locking is enabled and we don't need to update the primary for all locks, we can avoid sending
+		// If aggressive locking is enabled, and we don't need to update the primary for all locks, we can avoid sending
 		// RPC to those already locked keys.
-		if txn.aggressiveLockingContext != nil {
+		if txn.IsInAggressiveLockingMode() {
 			keys, err = txn.filterAggressiveLockedKeys(lockCtx, allKeys)
 			if err != nil {
 				return err
 			}
 
+			filteredAggressiveLockedKeysCount = len(allKeys) - len(keys)
+			metrics.AggressiveLockedKeysDerived.Add(float64(filteredAggressiveLockedKeysCount))
+			metrics.AggressiveLockedKeysNew.Add(float64(len(keys)))
+
 			if len(keys) == 0 {
+				if lockCtx.Stats != nil {
+					txn.collectAggressiveLockingStats(lockCtx, 0, 0, filteredAggressiveLockedKeysCount, lockWakeUpMode)
+				}
 				return nil
 			}
 		}
 
-		lockWaitMode := kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeNormal
-		if txn.aggressiveLockingContext != nil && len(keys) == 1 && !lockCtx.LockOnlyIfExists {
-			lockWaitMode = kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeForceLock
-		}
-		lockCtx.Stats = &util.LockKeysDetails{
-			LockKeys:    int32(len(keys)),
-			ResolveLock: util.ResolveLockDetail{},
+		if txn.IsInAggressiveLockingMode() && len(keys) == 1 {
+			lockWakeUpMode = kvrpcpb.PessimisticLockWakeUpMode_WakeUpModeForceLock
 		}
 		bo := retry.NewBackofferWithVars(ctx, pessimisticLockMaxBackoff, txn.vars)
 		// If the number of keys greater than 1, it can be on different region,
 		// concurrently execute on multiple regions may lead to deadlock.
 		txn.committer.isFirstLock = txn.lockedCnt == 0 && len(keys) == 1
-		err = txn.committer.pessimisticLockMutations(bo, lockCtx, lockWaitMode, &PlainMutations{keys: keys})
+		err = txn.committer.pessimisticLockMutations(bo, lockCtx, lockWakeUpMode, &PlainMutations{keys: keys})
 		if lockCtx.Stats != nil && bo.GetTotalSleep() > 0 {
 			atomic.AddInt64(&lockCtx.Stats.BackoffTime, int64(bo.GetTotalSleep())*int64(time.Millisecond))
 			lockCtx.Stats.Mu.Lock()
@@ -1024,7 +1106,7 @@ func (txn *KVTxn) lockKeys(ctx context.Context, lockCtx *tikv.LockCtx, fn func()
 			// We need to reset the killed flag here.
 			atomic.CompareAndSwapUint32(lockCtx.Killed, 1, 0)
 		}
-		if txn.aggressiveLockingContext != nil {
+		if txn.IsInAggressiveLockingMode() {
 			if txn.aggressiveLockingContext.maxLockedWithConflictTS < lockCtx.MaxLockedWithConflictTS {
 				txn.aggressiveLockingContext.maxLockedWithConflictTS = lockCtx.MaxLockedWithConflictTS
 			}
@@ -1065,7 +1147,7 @@ func (txn *KVTxn) lockKeys(ctx context.Context, lockCtx *tikv.LockCtx, fn func()
 				}
 				wg := txn.asyncPessimisticRollback(ctx, allKeys, rollbackForUpdateTS)
 				txn.lockedCnt -= len(allKeys) - len(keys)
-				if txn.aggressiveLockingContext != nil {
+				if txn.IsInAggressiveLockingMode() {
 					for _, k := range allKeys {
 						delete(txn.aggressiveLockingContext.currentLockedKeys, string(k))
 					}
@@ -1101,7 +1183,8 @@ func (txn *KVTxn) lockKeys(ctx context.Context, lockCtx *tikv.LockCtx, fn func()
 		}
 		txn.unsetPrimaryKeyIfNeeded(lockCtx)
 	}
-	skipedLockKeys := 0
+	skippedLockKeys := 0
+	err = nil
 	for _, key := range keys {
 		valExists := true
 		// PointGet and BatchPointGet will return value in pessimistic lock response, the value may not exist.
@@ -1116,11 +1199,28 @@ func (txn *KVTxn) lockKeys(ctx context.Context, lockCtx *tikv.LockCtx, fn func()
 				}
 			}
 		}
-		if txn.aggressiveLockingContext != nil {
+
+		// note that lock_only_if_exists guarantees the response tells us whether the value exists
+		if lockCtx.LockOnlyIfExists && !valExists {
+			skippedLockKeys++
+			continue
+		}
+
+		if txn.IsInAggressiveLockingMode() {
+			actualForUpdateTS := lockCtx.ForUpdateTS
+			if val.LockedWithConflictTS > actualForUpdateTS {
+				actualForUpdateTS = val.LockedWithConflictTS
+			} else if val.LockedWithConflictTS != 0 {
+				// If LockedWithConflictTS is not zero, it must indicate that there's a version of the key whose
+				// commitTS is greater than lockCtx.ForUpdateTS. Therefore, this branch should never be executed.
+				err = errors.Errorf("pessimistic lock request to key %v returns LockedWithConflictTS(%v) not greater than requested ForUpdateTS(%v)",
+					hex.EncodeToString(key), val.LockedWithConflictTS, lockCtx.ForUpdateTS)
+			}
 			txn.aggressiveLockingContext.currentLockedKeys[keyStr] = tempLockBufferEntry{
-				HasReturnValue:    lockCtx.ReturnValues,
-				HasCheckExistence: lockCtx.CheckExistence,
-				Value:             val,
+				HasReturnValue:        lockCtx.ReturnValues,
+				HasCheckExistence:     lockCtx.CheckExistence,
+				Value:                 val,
+				ActualLockForUpdateTS: actualForUpdateTS,
 			}
 			txn.aggressiveLockingDirty = true
 		} else {
@@ -1128,15 +1228,18 @@ func (txn *KVTxn) lockKeys(ctx context.Context, lockCtx *tikv.LockCtx, fn func()
 			if !valExists {
 				setValExists = tikv.SetKeyLockedValueNotExists
 			}
-			// TODO: Fix the calculation when aggressive-locking is active
-			if lockCtx.LockOnlyIfExists && !valExists {
-				skipedLockKeys++
-				continue
-			}
 			memBuf.UpdateFlags(key, tikv.SetKeyLocked, tikv.DelNeedCheckExists, setValExists)
 		}
 	}
-	txn.lockedCnt += len(keys) - skipedLockKeys
+	if err != nil {
+		return err
+	}
+
+	// Update statistics information.
+	txn.lockedCnt += len(keys) - skippedLockKeys
+	if txn.IsInAggressiveLockingMode() && lockCtx.Stats != nil {
+		txn.collectAggressiveLockingStats(lockCtx, len(keys), skippedLockKeys, filteredAggressiveLockedKeysCount, lockWakeUpMode)
+	}
 	return nil
 }
 
@@ -1146,7 +1249,7 @@ func (txn *KVTxn) resetPrimary() {
 }
 
 func (txn *KVTxn) selectPrimaryForPessimisticLock(sortedKeys [][]byte) {
-	if txn.aggressiveLockingContext != nil {
+	if txn.IsInAggressiveLockingMode() {
 		lastPrimaryKey := txn.aggressiveLockingContext.lastPrimaryKey
 		if lastPrimaryKey != nil {
 			foundIdx := sort.Search(len(sortedKeys), func(i int) bool {
@@ -1231,6 +1334,7 @@ func (txn *KVTxn) asyncPessimisticRollback(ctx context.Context, keys [][]byte, s
 		startTS:     txn.committer.startTS,
 		forUpdateTS: txn.committer.forUpdateTS,
 		primaryKey:  txn.committer.primaryKey,
+		isInternal:  txn.isInternal(),
 	}
 	if specifiedForUpdateTS > committer.forUpdateTS {
 		committer.forUpdateTS = specifiedForUpdateTS

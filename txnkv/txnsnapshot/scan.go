@@ -38,8 +38,6 @@ import (
 	"bytes"
 	"context"
 
-	"github.com/pingcap/kvproto/pkg/kvrpcpb"
-	"github.com/pkg/errors"
 	tikverr "github.com/ergesun/client-go/v2/error"
 	"github.com/ergesun/client-go/v2/internal/client"
 	"github.com/ergesun/client-go/v2/internal/locate"
@@ -49,6 +47,9 @@ import (
 	"github.com/ergesun/client-go/v2/tikvrpc"
 	"github.com/ergesun/client-go/v2/tikvrpc/interceptor"
 	"github.com/ergesun/client-go/v2/txnkv/txnlock"
+	"github.com/ergesun/client-go/v2/util"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
 
@@ -226,14 +227,6 @@ func (s *Scanner) getData(bo *retry.Backoffer) error {
 			}
 		}
 		sreq := &kvrpcpb.ScanRequest{
-			Context: &kvrpcpb.Context{
-				Priority:          s.snapshot.priority.ToPB(),
-				NotFillCache:      s.snapshot.notFillCache,
-				IsolationLevel:    s.snapshot.isolationLevel.ToPB(),
-				ResourceGroupTag:  s.snapshot.mu.resourceGroupTag,
-				RequestSource:     s.snapshot.GetRequestSource(),
-				ResourceGroupName: s.snapshot.mu.resourceGroupName,
-			},
 			StartKey:   s.nextStartKey,
 			EndKey:     reqEndKey,
 			Limit:      uint32(s.batchSize),
@@ -248,19 +241,22 @@ func (s *Scanner) getData(bo *retry.Backoffer) error {
 		}
 		s.snapshot.mu.RLock()
 		req := tikvrpc.NewReplicaReadRequest(tikvrpc.CmdScan, sreq, s.snapshot.mu.replicaRead, &s.snapshot.replicaReadSeed, kvrpcpb.Context{
-			Priority:          s.snapshot.priority.ToPB(),
-			NotFillCache:      s.snapshot.notFillCache,
-			TaskId:            s.snapshot.mu.taskID,
-			ResourceGroupTag:  s.snapshot.mu.resourceGroupTag,
-			IsolationLevel:    s.snapshot.isolationLevel.ToPB(),
-			RequestSource:     s.snapshot.GetRequestSource(),
-			ResourceGroupName: s.snapshot.mu.resourceGroupName,
+			Priority:         s.snapshot.priority.ToPB(),
+			NotFillCache:     s.snapshot.notFillCache,
+			TaskId:           s.snapshot.mu.taskID,
+			ResourceGroupTag: s.snapshot.mu.resourceGroupTag,
+			IsolationLevel:   s.snapshot.isolationLevel.ToPB(),
+			RequestSource:    s.snapshot.GetRequestSource(),
+			ResourceControlContext: &kvrpcpb.ResourceControlContext{
+				ResourceGroupName: util.ResourceGroupNameFromCtx(bo.GetCtx()),
+			},
+			BusyThresholdMs: uint32(s.snapshot.mu.busyThreshold.Milliseconds()),
 		})
 		if s.snapshot.mu.resourceGroupTag == nil && s.snapshot.mu.resourceGroupTagger != nil {
 			s.snapshot.mu.resourceGroupTagger(req)
 		}
 		s.snapshot.mu.RUnlock()
-		resp, err := sender.SendReq(bo, req, loc.Region, client.ReadTimeoutMedium)
+		resp, _, err := sender.SendReq(bo, req, loc.Region, client.ReadTimeoutMedium)
 		if err != nil {
 			return err
 		}

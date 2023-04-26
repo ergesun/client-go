@@ -3,9 +3,9 @@ package apicodec
 import (
 	"encoding/binary"
 
+	"github.com/ergesun/client-go/v2/tikvrpc"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
-	"github.com/ergesun/client-go/v2/tikvrpc"
 )
 
 type (
@@ -23,15 +23,15 @@ const (
 )
 
 const (
-	// NulSpaceID is a special keyspace id that represents no keyspace exist.
-	NulSpaceID KeyspaceID = 0xffffffff
+	// NullspaceID is a special keyspace id that represents no keyspace exist.
+	NullspaceID KeyspaceID = 0xffffffff
 )
 
 // ParseKeyspaceID retrieves the keyspaceID from the given keyspace-encoded key.
 // It returns error if the given key is not in proper api-v2 format.
 func ParseKeyspaceID(b []byte) (KeyspaceID, error) {
 	if err := checkV2Key(b); err != nil {
-		return NulSpaceID, err
+		return NullspaceID, err
 	}
 
 	buf := append([]byte{}, b[:keyspacePrefixLen]...)
@@ -57,6 +57,8 @@ type Codec interface {
 	EncodeRegionKey(key []byte) []byte
 	// DecodeRegionKey decode region's key
 	DecodeRegionKey(encodedKey []byte) ([]byte, error)
+	// DecodeBucketKeys decode region bucket's key
+	DecodeBucketKeys(keys [][]byte) ([][]byte, error)
 	// EncodeRegionRange encode region's start and end.
 	EncodeRegionRange(start, end []byte) ([]byte, []byte)
 	// DecodeRegionRange decode region's start and end.
@@ -84,4 +86,34 @@ func DecodeKey(encoded []byte, version kvrpcpb.APIVersion) ([]byte, []byte, erro
 		return encoded[:keyspacePrefixLen], encoded[keyspacePrefixLen:], nil
 	}
 	return nil, nil, errors.Errorf("unsupported api version %s", version.String())
+}
+
+func attachAPICtx(c Codec, req *tikvrpc.Request) *tikvrpc.Request {
+	// Shallow copy the request to avoid concurrent modification.
+	r := *req
+
+	ctx := &r.Context
+	ctx.ApiVersion = c.GetAPIVersion()
+	ctx.KeyspaceId = uint32(c.GetKeyspaceID())
+
+	switch r.Type {
+	case tikvrpc.CmdMPPTask:
+		mpp := *r.DispatchMPPTask()
+		// Shallow copy the meta to avoid concurrent modification.
+		meta := *mpp.Meta
+		meta.KeyspaceId = ctx.KeyspaceId
+		meta.ApiVersion = ctx.ApiVersion
+		mpp.Meta = &meta
+		r.Req = &mpp
+
+	case tikvrpc.CmdCompact:
+		compact := *r.Compact()
+		compact.KeyspaceId = ctx.KeyspaceId
+		compact.ApiVersion = ctx.ApiVersion
+		r.Req = &compact
+	}
+
+	tikvrpc.AttachContext(&r, ctx)
+
+	return &r
 }

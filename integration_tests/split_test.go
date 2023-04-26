@@ -36,18 +36,19 @@ package tikv_test
 
 import (
 	"context"
-	rmpb "github.com/pingcap/kvproto/pkg/resource_manager"
 	"sync"
 	"testing"
 
-	"github.com/pingcap/kvproto/pkg/keyspacepb"
-	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/kvproto/pkg/pdpb"
-	"github.com/pkg/errors"
-	"github.com/stretchr/testify/suite"
 	"github.com/ergesun/client-go/v2/testutils"
 	"github.com/ergesun/client-go/v2/tikv"
 	"github.com/ergesun/client-go/v2/txnkv/transaction"
+	"github.com/pingcap/kvproto/pkg/keyspacepb"
+	"github.com/pingcap/kvproto/pkg/meta_storagepb"
+	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/pingcap/kvproto/pkg/pdpb"
+	rmpb "github.com/pingcap/kvproto/pkg/resource_manager"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/suite"
 	pd "github.com/tikv/pd/client"
 )
 
@@ -336,4 +337,32 @@ func (c *mockPDClient) GetExternalTimestamp(ctx context.Context) (uint64, error)
 
 func (c *mockPDClient) SetExternalTimestamp(ctx context.Context, tso uint64) error {
 	panic("unimplemented")
+}
+
+func (c *mockPDClient) GetTSWithinKeyspace(ctx context.Context, keyspaceID uint32) (int64, int64, error) {
+	return 0, 0, nil
+}
+
+func (c *mockPDClient) GetTSWithinKeyspaceAsync(ctx context.Context, keyspaceID uint32) pd.TSFuture {
+	return nil
+}
+
+func (c *mockPDClient) GetLocalTSWithinKeyspace(ctx context.Context, dcLocation string, keyspaceID uint32) (int64, int64, error) {
+	return 0, 0, nil
+}
+
+func (c *mockPDClient) GetLocalTSWithinKeyspaceAsync(ctx context.Context, dcLocation string, keyspaceID uint32) pd.TSFuture {
+	return nil
+}
+
+func (c *mockPDClient) Watch(ctx context.Context, key []byte, opts ...pd.OpOption) (chan []*meta_storagepb.Event, error) {
+	return nil, nil
+}
+
+func (c *mockPDClient) Get(ctx context.Context, key []byte, opts ...pd.OpOption) (*meta_storagepb.GetResponse, error) {
+	return nil, nil
+}
+
+func (c *mockPDClient) Put(ctx context.Context, key []byte, value []byte, opts ...pd.OpOption) (*meta_storagepb.PutResponse, error) {
+	return nil, nil
 }

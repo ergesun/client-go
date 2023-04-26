@@ -16,7 +16,7 @@ package resourcecontrol
 
 import (
 	"reflect"
-	"unsafe"
+	"time"
 
 	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
@@ -32,6 +32,7 @@ type RequestInfo struct {
 	// writeBytes is the actual write size if the request is a write request,
 	// or -1 if it's a read request.
 	writeBytes int64
+	storeID    uint64
 }
 
 // MakeRequestInfo extracts the relevant information from a BatchRequest.
@@ -43,12 +44,20 @@ func MakeRequestInfo(req *tikvrpc.Request) *RequestInfo {
 	var writeBytes int64
 	switch r := req.Req.(type) {
 	case *kvrpcpb.PrewriteRequest:
-		writeBytes += int64(r.TxnSize)
+		for _, m := range r.Mutations {
+			writeBytes += int64(len(m.Key)) + int64(len(m.Value))
+		}
+		writeBytes += int64(len(r.PrimaryLock))
+		for _, l := range r.Secondaries {
+			writeBytes += int64(len(l))
+		}
 	case *kvrpcpb.CommitRequest:
-		writeBytes += int64(unsafe.Sizeof(r.Keys))
+		for _, k := range r.Keys {
+			writeBytes += int64(len(k))
+		}
 	}
 
-	return &RequestInfo{writeBytes: writeBytes}
+	return &RequestInfo{writeBytes: writeBytes * req.ReplicaNumber, storeID: req.Context.Peer.StoreId}
 }
 
 // IsWrite returns whether the request is a write request.
@@ -62,13 +71,17 @@ func (req *RequestInfo) WriteBytes() uint64 {
 	return uint64(req.writeBytes)
 }
 
+func (req *RequestInfo) StoreID() uint64 {
+	return req.storeID
+}
+
 // ResponseInfo contains information about a response that is able to calculate the RU cost
 // after the response is received. Specifically, the read bytes RU cost of a read request
 // could be calculated by its response size, and the KV CPU time RU cost of a request could
 // be calculated by its execution details info.
 type ResponseInfo struct {
 	readBytes uint64
-	kvCPUMs   uint64
+	kvCPU     time.Duration
 }
 
 // MakeResponseInfo extracts the relevant information from a BatchResponse.
@@ -102,7 +115,7 @@ func MakeResponseInfo(resp *tikvrpc.Response) *ResponseInfo {
 		// TODO: using a more accurate size rather than using the whole response size as the read bytes.
 		readBytes = uint64(r.Size())
 	default:
-		log.Warn("[kv resource] unknown response type to collect the info", zap.Any("type", reflect.TypeOf(r)))
+		log.Debug("[kv resource] unknown response type to collect the info", zap.Any("type", reflect.TypeOf(r)))
 		return &ResponseInfo{}
 	}
 	// Try to get read bytes from the `detailsV2`.
@@ -111,19 +124,22 @@ func MakeResponseInfo(resp *tikvrpc.Response) *ResponseInfo {
 		readBytes = scanDetail.GetProcessedVersionsSize()
 	}
 	// Get the KV CPU time in milliseconds from the execution time details.
-	kvCPUMs := getKVCPUMs(detailsV2, details)
-	return &ResponseInfo{readBytes: readBytes, kvCPUMs: kvCPUMs}
+	kvCPU := getKVCPU(detailsV2, details)
+	return &ResponseInfo{readBytes: readBytes, kvCPU: kvCPU}
 }
 
 // TODO: find out a more accurate way to get the actual KV CPU time.
-func getKVCPUMs(detailsV2 *kvrpcpb.ExecDetailsV2, details *kvrpcpb.ExecDetails) uint64 {
+func getKVCPU(detailsV2 *kvrpcpb.ExecDetailsV2, details *kvrpcpb.ExecDetails) time.Duration {
+	if timeDetail := detailsV2.GetTimeDetailV2(); timeDetail != nil {
+		return time.Duration(timeDetail.GetProcessWallTimeNs())
+	}
 	if timeDetail := detailsV2.GetTimeDetail(); timeDetail != nil {
-		return timeDetail.GetProcessWallTimeMs()
+		return time.Duration(timeDetail.GetProcessWallTimeMs()) * time.Millisecond
 	}
 	if timeDetail := details.GetTimeDetail(); timeDetail != nil {
-		return timeDetail.GetProcessWallTimeMs()
+		return time.Duration(timeDetail.GetProcessWallTimeMs()) * time.Millisecond
 	}
-	return 0
+	return time.Duration(0)
 }
 
 // ReadBytes returns the read bytes of the response.
@@ -131,7 +147,13 @@ func (res *ResponseInfo) ReadBytes() uint64 {
 	return res.readBytes
 }
 
-// KVCPUMs returns the KV CPU time in milliseconds of the response.
-func (res *ResponseInfo) KVCPUMs() uint64 {
-	return res.kvCPUMs
+// KVCPU returns the KV CPU time of the response.
+func (res *ResponseInfo) KVCPU() time.Duration {
+	return res.kvCPU
+}
+
+// Succeed returns whether the KV request is successful.
+// Todo: to fit https://github.com/tikv/pd/pull/5941
+func (res *ResponseInfo) Succeed() bool {
+	return true
 }
