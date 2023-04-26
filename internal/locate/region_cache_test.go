@@ -997,7 +997,7 @@ func (s *testRegionCacheSuite) TestRegionEpochOnTiFlash() {
 	s.Equal(lctx.Peer.Id, peer3)
 
 	// epoch-not-match on tiflash
-	ctxTiFlash, err := s.cache.GetTiFlashRPCContext(s.bo, loc1.Region, true)
+	ctxTiFlash, err := s.cache.GetTiFlashRPCContext(s.bo, loc1.Region, true, LabelFilterNoTiFlashWriteNode)
 	s.Nil(err)
 	s.Equal(ctxTiFlash.Peer.Id, s.peer1)
 	ctxTiFlash.Peer.Role = metapb.PeerRole_Learner
@@ -1701,4 +1701,30 @@ func (s *testRegionCacheSuite) TestBackgroundCacheGC() {
 		return len(s.cache.mu.regions) == remaining
 	}, 3*time.Second, 200*time.Millisecond)
 	s.checkCache(remaining)
+}
+
+func (s *testRegionCacheSuite) TestSlowScoreStat() {
+	slowScore := SlowScoreStat{
+		avgScore: 1,
+	}
+	s.False(slowScore.isSlow())
+	slowScore.recordSlowScoreStat(time.Millisecond * 1)
+	slowScore.updateSlowScore()
+	s.False(slowScore.isSlow())
+	for i := 2; i <= 100; i++ {
+		slowScore.recordSlowScoreStat(time.Millisecond * time.Duration(i))
+		if i%5 == 0 {
+			slowScore.updateSlowScore()
+			s.False(slowScore.isSlow())
+		}
+	}
+	for i := 100; i >= 2; i-- {
+		slowScore.recordSlowScoreStat(time.Millisecond * time.Duration(i))
+		if i%5 == 0 {
+			slowScore.updateSlowScore()
+			s.False(slowScore.isSlow())
+		}
+	}
+	slowScore.markAlreadySlow()
+	s.True(slowScore.isSlow())
 }

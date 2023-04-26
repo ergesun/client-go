@@ -4,11 +4,14 @@ import (
 	"math"
 	"testing"
 
+	"github.com/ergesun/client-go/v2/tikvrpc"
+	"github.com/ergesun/client-go/v2/util/codec"
+	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"github.com/pingcap/kvproto/pkg/errorpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/pingcap/kvproto/pkg/mpp"
 	"github.com/stretchr/testify/suite"
-	"github.com/ergesun/client-go/v2/tikvrpc"
 )
 
 var (
@@ -16,12 +19,13 @@ var (
 	// Keys below are ordered as following:
 	// beforePrefix, keyspacePrefix, insideLeft, insideRight, keyspaceEndKey, afterEndKey
 	// where valid keyspace range is [keyspacePrefix, keyspaceEndKey)
-	keyspacePrefix = []byte{'r', 0, 16, 146}
-	keyspaceEndKey = []byte{'r', 0, 16, 147}
-	beforePrefix   = []byte{'r', 0, 0, 1}
-	afterEndKey    = []byte{'r', 1, 0, 0}
-	insideLeft     = []byte{'r', 0, 16, 146, 100}
-	insideRight    = []byte{'r', 0, 16, 146, 200}
+	prevKeyspacePrefix = []byte{'r', 0, 16, 145}
+	keyspacePrefix     = []byte{'r', 0, 16, 146}
+	keyspaceEndKey     = []byte{'r', 0, 16, 147}
+	beforePrefix       = []byte{'r', 0, 0, 1}
+	afterEndKey        = []byte{'r', 1, 0, 0}
+	insideLeft         = []byte{'r', 0, 16, 146, 100}
+	insideRight        = []byte{'r', 0, 16, 146, 200}
 )
 
 type testCodecV2Suite struct {
@@ -269,4 +273,94 @@ func (suite *testCodecV2Suite) TestDecodeEpochNotMatch() {
 
 func (suite *testCodecV2Suite) TestGetKeyspaceID() {
 	suite.Equal(KeyspaceID(testKeyspaceID), suite.codec.GetKeyspaceID())
+}
+
+func (suite *testCodecV2Suite) TestEncodeMPPRequest() {
+	req, err := suite.codec.EncodeRequest(&tikvrpc.Request{
+		Type: tikvrpc.CmdMPPTask,
+		Req: &mpp.DispatchTaskRequest{
+			Meta: &mpp.TaskMeta{},
+			Regions: []*coprocessor.RegionInfo{
+				{
+					Ranges: []*coprocessor.KeyRange{{Start: []byte("a"), End: []byte("b")}},
+				},
+			},
+		},
+	})
+	suite.Nil(err)
+	task, ok := req.Req.(*mpp.DispatchTaskRequest)
+	suite.True(ok)
+	suite.Equal(task.Meta.KeyspaceId, testKeyspaceID)
+	suite.Equal(task.Meta.ApiVersion, kvrpcpb.APIVersion_V2)
+	suite.Equal(task.Regions[0].Ranges[0].Start, suite.codec.EncodeKey([]byte("a")))
+	suite.Equal(task.Regions[0].Ranges[0].End, suite.codec.EncodeKey([]byte("b")))
+}
+
+func (suite *testCodecV2Suite) TestDecodeBucketKeys() {
+	encodeWithPrefix := func(prefix, key []byte) []byte {
+		return codec.EncodeBytes(nil, append(prefix, key...))
+	}
+
+	bucketKeys := [][]byte{
+		encodeWithPrefix(prevKeyspacePrefix, []byte("a")),
+		encodeWithPrefix(prevKeyspacePrefix, []byte("b")),
+		encodeWithPrefix(prevKeyspacePrefix, []byte("c")),
+		suite.codec.EncodeRegionKey([]byte("a")),
+		suite.codec.EncodeRegionKey([]byte("b")),
+		suite.codec.EncodeRegionKey([]byte("c")),
+		encodeWithPrefix(keyspaceEndKey, []byte("")),
+		encodeWithPrefix(keyspaceEndKey, []byte("a")),
+		encodeWithPrefix(keyspaceEndKey, []byte("b")),
+		encodeWithPrefix(keyspaceEndKey, []byte("c")),
+	}
+	keys, err := suite.codec.DecodeBucketKeys(bucketKeys)
+	suite.Nil(err)
+	suite.Equal([][]byte{
+		{},
+		[]byte("a"),
+		[]byte("b"),
+		[]byte("c"),
+		{},
+	}, keys)
+
+	bucketKeys = [][]byte{
+		encodeWithPrefix(prevKeyspacePrefix, []byte("a")),
+		encodeWithPrefix(prevKeyspacePrefix, []byte("b")),
+		encodeWithPrefix(prevKeyspacePrefix, []byte("c")),
+		suite.codec.EncodeRegionKey([]byte("")),
+		suite.codec.EncodeRegionKey([]byte("a")),
+		suite.codec.EncodeRegionKey([]byte("b")),
+		suite.codec.EncodeRegionKey([]byte("c")),
+		{},
+	}
+	keys, err = suite.codec.DecodeBucketKeys(bucketKeys)
+	suite.Nil(err)
+	suite.Equal([][]byte{
+		{},
+		[]byte("a"),
+		[]byte("b"),
+		[]byte("c"),
+		{},
+	}, keys)
+
+	bucketKeys = [][]byte{
+		{},
+		encodeWithPrefix(prevKeyspacePrefix, []byte("a")),
+		encodeWithPrefix(prevKeyspacePrefix, []byte("b")),
+		encodeWithPrefix(prevKeyspacePrefix, []byte("c")),
+		suite.codec.EncodeRegionKey([]byte("")),
+		suite.codec.EncodeRegionKey([]byte("a")),
+		suite.codec.EncodeRegionKey([]byte("b")),
+		suite.codec.EncodeRegionKey([]byte("c")),
+		{},
+	}
+	keys, err = suite.codec.DecodeBucketKeys(bucketKeys)
+	suite.Nil(err)
+	suite.Equal([][]byte{
+		{},
+		[]byte("a"),
+		[]byte("b"),
+		[]byte("c"),
+		{},
+	}, keys)
 }

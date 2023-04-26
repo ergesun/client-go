@@ -3,6 +3,7 @@ package apicodec
 import (
 	"testing"
 
+	"github.com/ergesun/client-go/v2/tikvrpc"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/stretchr/testify/assert"
 )
@@ -18,11 +19,11 @@ func TestParseKeyspaceID(t *testing.T) {
 
 	id, err = ParseKeyspaceID([]byte{'t', 0, 0})
 	assert.NotNil(t, err)
-	assert.Equal(t, NulSpaceID, id)
+	assert.Equal(t, NullspaceID, id)
 
 	id, err = ParseKeyspaceID([]byte{'t', 0, 0, 1, 1, 2, 3})
 	assert.NotNil(t, err)
-	assert.Equal(t, NulSpaceID, id)
+	assert.Equal(t, NullspaceID, id)
 }
 
 func TestDecodeKey(t *testing.T) {
@@ -45,4 +46,14 @@ func TestDecodeKey(t *testing.T) {
 	assert.NotNil(t, err)
 	assert.Empty(t, pfx)
 	assert.Empty(t, key)
+}
+
+func TestEncodeUnknownRequest(t *testing.T) {
+	req := &tikvrpc.Request{
+		Type: tikvrpc.CmdStoreSafeTS,
+		Req:  &kvrpcpb.StoreSafeTSRequest{},
+	}
+	c := NewCodecV1(ModeTxn)
+	_, err := c.EncodeRequest(req)
+	assert.Nil(t, err)
 }

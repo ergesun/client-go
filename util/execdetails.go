@@ -37,6 +37,7 @@ package util
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"math"
 	"strconv"
 	"sync"
@@ -44,6 +45,8 @@ import (
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	rmpb "github.com/pingcap/kvproto/pkg/resource_manager"
+	uatomic "go.uber.org/atomic"
 )
 
 type commitDetailCtxKeyType struct{}
@@ -88,7 +91,7 @@ func NewTiKVExecDetails(pb *kvrpcpb.ExecDetailsV2) TiKVExecDetails {
 		return TiKVExecDetails{}
 	}
 	td := &TimeDetail{}
-	td.MergeFromTimeDetail(pb.TimeDetail)
+	td.MergeFromTimeDetail(pb.TimeDetailV2, pb.TimeDetail)
 	sd := &ScanDetail{}
 	sd.MergeFromScanDetailV2(pb.ScanDetailV2)
 	wd := &WriteDetail{}
@@ -239,12 +242,15 @@ func (cd *CommitDetails) Clone() *CommitDetails {
 
 // LockKeysDetails contains pessimistic lock keys detail information.
 type LockKeysDetails struct {
-	TotalTime   time.Duration
-	RegionNum   int32
-	LockKeys    int32
-	ResolveLock ResolveLockDetail
-	BackoffTime int64
-	Mu          struct {
+	TotalTime                  time.Duration
+	RegionNum                  int32
+	LockKeys                   int32
+	AggressiveLockNewCount     int
+	AggressiveLockDerivedCount int
+	LockedWithConflictCount    int
+	ResolveLock                ResolveLockDetail
+	BackoffTime                int64
+	Mu                         struct {
 		sync.Mutex
 		BackoffTypes        []string
 		SlowestReqTotalTime time.Duration
@@ -262,6 +268,9 @@ func (ld *LockKeysDetails) Merge(lockKey *LockKeysDetails) {
 	ld.TotalTime += lockKey.TotalTime
 	ld.RegionNum += lockKey.RegionNum
 	ld.LockKeys += lockKey.LockKeys
+	ld.AggressiveLockNewCount += lockKey.AggressiveLockNewCount
+	ld.AggressiveLockDerivedCount += lockKey.AggressiveLockDerivedCount
+	ld.LockedWithConflictCount += lockKey.LockedWithConflictCount
 	ld.ResolveLock.ResolveLockTime += lockKey.ResolveLock.ResolveLockTime
 	ld.BackoffTime += lockKey.BackoffTime
 	ld.LockRPCTime += lockKey.LockRPCTime
@@ -294,14 +303,17 @@ func (ld *LockKeysDetails) MergeReqDetails(reqDuration time.Duration, regionID u
 // Clone returns a deep copy of itself.
 func (ld *LockKeysDetails) Clone() *LockKeysDetails {
 	lock := &LockKeysDetails{
-		TotalTime:    ld.TotalTime,
-		RegionNum:    ld.RegionNum,
-		LockKeys:     ld.LockKeys,
-		BackoffTime:  ld.BackoffTime,
-		LockRPCTime:  ld.LockRPCTime,
-		LockRPCCount: ld.LockRPCCount,
-		RetryCount:   ld.RetryCount,
-		ResolveLock:  ld.ResolveLock,
+		TotalTime:                  ld.TotalTime,
+		RegionNum:                  ld.RegionNum,
+		LockKeys:                   ld.LockKeys,
+		AggressiveLockNewCount:     ld.AggressiveLockNewCount,
+		AggressiveLockDerivedCount: ld.AggressiveLockDerivedCount,
+		LockedWithConflictCount:    ld.LockedWithConflictCount,
+		BackoffTime:                ld.BackoffTime,
+		LockRPCTime:                ld.LockRPCTime,
+		LockRPCCount:               ld.LockRPCCount,
+		RetryCount:                 ld.RetryCount,
+		ResolveLock:                ld.ResolveLock,
 	}
 	lock.Mu.BackoffTypes = append([]string{}, ld.Mu.BackoffTypes...)
 	lock.Mu.SlowestReqTotalTime = ld.Mu.SlowestReqTotalTime
@@ -321,12 +333,12 @@ type ExecDetails struct {
 
 // FormatDuration uses to format duration, this function will prune precision before format duration.
 // Pruning precision is for human readability. The prune rule is:
-// 1. if the duration was less than 1us, return the original string.
-// 2. readable value >=10, keep 1 decimal, otherwise, keep 2 decimal. such as:
-//    9.412345ms  -> 9.41ms
-//    10.412345ms -> 10.4ms
-//    5.999s      -> 6s
-//    100.45µs    -> 100.5µs
+//  1. if the duration was less than 1us, return the original string.
+//  2. readable value >=10, keep 1 decimal, otherwise, keep 2 decimal. such as:
+//     9.412345ms  -> 9.41ms
+//     10.412345ms -> 10.4ms
+//     5.999s      -> 6s
+//     100.45µs    -> 100.5µs
 func FormatDuration(d time.Duration) string {
 	if d <= time.Microsecond {
 		return d.String()
@@ -597,11 +609,13 @@ type TimeDetail struct {
 	// cannot be excluded for now, like Mutex wait time, which is included in this field, so that
 	// this field is called wall time instead of CPU time.
 	ProcessTime time.Duration
+	// Cpu wall time elapsed that task is waiting in queue.
+	SuspendTime time.Duration
 	// Off-cpu wall time elapsed in TiKV side. Usually this includes queue waiting time and
 	// other kind of waits in series.
 	WaitTime time.Duration
-	// KvReadWallTimeMs is the time used in KV Scan/Get.
-	KvReadWallTimeMs time.Duration
+	// KvReadWallTime is the time used in KV Scan/Get.
+	KvReadWallTime time.Duration
 	// TotalRPCWallTime is Total wall clock time spent on this RPC in TiKV.
 	TotalRPCWallTime time.Duration
 }
@@ -615,6 +629,13 @@ func (td *TimeDetail) String() string {
 	if td.ProcessTime > 0 {
 		buf.WriteString("total_process_time: ")
 		buf.WriteString(FormatDuration(td.ProcessTime))
+	}
+	if td.SuspendTime > 0 {
+		if buf.Len() > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString("total_suspend_time: ")
+		buf.WriteString(FormatDuration(td.SuspendTime))
 	}
 	if td.WaitTime > 0 {
 		if buf.Len() > 0 {
@@ -634,11 +655,17 @@ func (td *TimeDetail) String() string {
 }
 
 // MergeFromTimeDetail merges time detail from pb into itself.
-func (td *TimeDetail) MergeFromTimeDetail(timeDetail *kvrpcpb.TimeDetail) {
-	if timeDetail != nil {
+func (td *TimeDetail) MergeFromTimeDetail(timeDetailV2 *kvrpcpb.TimeDetailV2, timeDetail *kvrpcpb.TimeDetail) {
+	if timeDetailV2 != nil {
+		td.WaitTime += time.Duration(timeDetailV2.WaitWallTimeNs) * time.Nanosecond
+		td.ProcessTime += time.Duration(timeDetailV2.ProcessWallTimeNs) * time.Nanosecond
+		td.SuspendTime += time.Duration(timeDetailV2.ProcessSuspendWallTimeNs) * time.Nanosecond
+		td.KvReadWallTime += time.Duration(timeDetailV2.KvReadWallTimeNs) * time.Nanosecond
+		td.TotalRPCWallTime += time.Duration(timeDetailV2.TotalRpcWallTimeNs) * time.Nanosecond
+	} else if timeDetail != nil {
 		td.WaitTime += time.Duration(timeDetail.WaitWallTimeMs) * time.Millisecond
 		td.ProcessTime += time.Duration(timeDetail.ProcessWallTimeMs) * time.Millisecond
-		td.KvReadWallTimeMs += time.Duration(timeDetail.KvReadWallTimeMs) * time.Millisecond
+		td.KvReadWallTime += time.Duration(timeDetail.KvReadWallTimeMs) * time.Millisecond
 		td.TotalRPCWallTime += time.Duration(timeDetail.TotalRpcWallTimeNs) * time.Nanosecond
 	}
 }
@@ -653,4 +680,56 @@ type ResolveLockDetail struct {
 // Merge merges resolve lock detail details into self.
 func (rd *ResolveLockDetail) Merge(resolveLock *ResolveLockDetail) {
 	rd.ResolveLockTime += resolveLock.ResolveLockTime
+}
+
+// RURuntimeStats is the runtime stats collector for RU.
+type RURuntimeStats struct {
+	readRU  *uatomic.Float64
+	writeRU *uatomic.Float64
+}
+
+// NewRURuntimeStats creates a new RURuntimeStats.
+func NewRURuntimeStats() *RURuntimeStats {
+	return &RURuntimeStats{
+		readRU:  uatomic.NewFloat64(0),
+		writeRU: uatomic.NewFloat64(0),
+	}
+}
+
+// Clone implements the RuntimeStats interface.
+func (rs *RURuntimeStats) Clone() *RURuntimeStats {
+	return &RURuntimeStats{
+		readRU:  uatomic.NewFloat64(rs.readRU.Load()),
+		writeRU: uatomic.NewFloat64(rs.writeRU.Load()),
+	}
+}
+
+// Merge implements the RuntimeStats interface.
+func (rs *RURuntimeStats) Merge(other *RURuntimeStats) {
+	rs.readRU.Add(other.readRU.Load())
+	rs.writeRU.Add(other.writeRU.Load())
+}
+
+// String implements fmt.Stringer interface.
+func (rs *RURuntimeStats) String() string {
+	return fmt.Sprintf("RRU:%f, WRU:%f", rs.readRU.Load(), rs.writeRU.Load())
+}
+
+// RRU returns the read RU.
+func (rs RURuntimeStats) RRU() float64 {
+	return rs.readRU.Load()
+}
+
+// WRU returns the write RU.
+func (rs RURuntimeStats) WRU() float64 {
+	return rs.writeRU.Load()
+}
+
+// Update updates the RU runtime stats with the given consumption info.
+func (rs *RURuntimeStats) Update(consumption *rmpb.Consumption) {
+	if rs == nil || consumption == nil {
+		return
+	}
+	rs.readRU.Add(consumption.RRU)
+	rs.writeRU.Add(consumption.WRU)
 }
